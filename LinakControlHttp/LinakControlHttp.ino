@@ -15,21 +15,24 @@
 #define MAX_DISTANCE 400       // Max distance of HC-SR04 (cm)
 #define MIN_DESK_HEIGHT 65     // Min height (inclusive) of Linak desk (cm)
 #define MAX_DESK_HEIGHT 130    // Max height (inclusive) of Linak desk (cm)
-#define HEIGHT_POLL_RATE 150   // Poll rate when desk is moving (ms)
+#define HEIGHT_POLL_RATE 60   // Poll rate when desk is moving (ms)
 #define ROOM_HEIGHT 264
+#define AVG_SAMPLES 20
 
 WiFiServer server(80);
 NewPing sonar(TRIGGER_PIN, ECHO_PIN, MAX_DISTANCE);
 
+unsigned long last_req;
+
 /* Return 0 on error */
-unsigned int get_desk_height()
+double get_desk_height_inner(int samples)
 {
-  sonar.ping();
-  delay(50);
   noInterrupts();
-  unsigned int ping_time = sonar.ping();
-  interrupts();
-  unsigned int cm = ping_time / US_ROUNDTRIP_CM;
+  cli();
+  double ping_time = sonar.ping_median(samples);
+  sei();
+  interrupts();  
+  double cm = ping_time / US_ROUNDTRIP_CM;
 
   // HC-SR04 datasheet says these are impossible, so error.
   if (cm < MIN_DISTANCE || cm > MAX_DISTANCE) {
@@ -37,6 +40,31 @@ unsigned int get_desk_height()
   }
 
   return ROOM_HEIGHT - cm;
+}
+
+void maybe_delay() {
+  unsigned long next_allowed = last_req + HEIGHT_POLL_RATE;
+  unsigned long current_time = millis();
+  if (current_time < next_allowed) {
+    delay(next_allowed - current_time);
+  }
+  last_req = millis();
+}
+
+double get_desk_height(unsigned int samples)
+{
+  double height = 0;
+  unsigned int limit = 10;
+
+  while (!(height > (MIN_DESK_HEIGHT - 10) && height < (MAX_DESK_HEIGHT + 10)) && limit-- > 0) {
+    maybe_delay();
+    height = get_desk_height_inner(samples);
+    if (!(height > (MIN_DESK_HEIGHT - 10) && height < (MAX_DESK_HEIGHT + 10)) && limit-- > 0) {
+      Serial.println(height);
+    }
+  }
+
+  return height;
 }
 
 void stop_moving()
@@ -47,7 +75,7 @@ void stop_moving()
 
 void set_desk_height(unsigned int target_height)
 {
-  int current_height = get_desk_height();
+  double current_height = get_desk_height(1);
   //  Serial.println(current_height);
 
   if (current_height == 0 || current_height == target_height) {
@@ -75,14 +103,14 @@ void set_desk_height(unsigned int target_height)
       break;
     }
 
-    int new_height = get_desk_height();
+    int new_height = get_desk_height(1);
 
     if (new_height == 0) {
       // Bail out, error.
       break;
     }
 
-    if (abs(new_height - current_height) >= 10) {
+    if (abs(new_height - current_height) >= 5) {
       // Bail out, the desk has moved unreasonably far for some reason...
       break;
     }
@@ -123,18 +151,10 @@ bool containsHeight(String line) {
   return false;
 }
 
-void setup()
-{
-  Serial.begin(SERIAL_RATE);
-  //  pinMode(LED_PIN, OUTPUT);      // set the LED pin mode
-
-  pinMode(UP_RELAY_PIN, OUTPUT);
-  pinMode(DOWN_RELAY_PIN, OUTPUT);
-  stop_moving();
-
-  delay(10);
-
-  // We start by connecting to a WiFi network
+void setup_wifi() {
+  digitalWrite(LED_PIN, HIGH);
+  WiFi.disconnect(true);
+  
   Serial.println();
   Serial.println();
   Serial.print("Connecting to ");
@@ -151,11 +171,31 @@ void setup()
   Serial.println("WiFi connected.");
   Serial.println("IP address: ");
   Serial.println(WiFi.localIP());
+  digitalWrite(LED_PIN, LOW);
+}
 
-  server.begin();
+void setup()
+{
+  Serial.begin(SERIAL_RATE);
+  pinMode(LED_PIN, OUTPUT);      // set the LED pin mode
+
+  pinMode(UP_RELAY_PIN, OUTPUT);
+  pinMode(DOWN_RELAY_PIN, OUTPUT);
+  stop_moving();
+
+  last_req = millis();
+
+  // We start by connecting to a WiFi network
+  setup_wifi();
+
+  server.begin(); 
 }
 
 void loop() {
+  if (WiFi.status() != WL_CONNECTED){
+    setup_wifi();
+  }
+  
   WiFiClient client = server.available();   // listen for incoming clients
 
   if (client) {                             // if you get a client,
@@ -175,7 +215,7 @@ void loop() {
             client.println();
 
             // the content of the HTTP response follows the header:
-            client.println(String(get_desk_height()));
+            client.println(String(get_desk_height(AVG_SAMPLES)));
 
             // The HTTP response ends with another blank line:
             client.println();
@@ -189,7 +229,6 @@ void loop() {
         }
 
         if (containsHeight(currentLine)) {
-          Serial.println(currentLine);
           unsigned int desk_height = (unsigned int) getValue(currentLine, '/', 1).toInt();
           if (desk_height >= MIN_DESK_HEIGHT && desk_height <= MAX_DESK_HEIGHT) {
             set_desk_height(desk_height);
